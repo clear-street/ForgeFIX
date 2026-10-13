@@ -484,7 +484,10 @@ where
     let msg = match maybe_msg {
         Ok(b) => Arc::new(b),
         Err(error) => {
-            state_machine.handle(&Event::SessionErrorReceived { error });
+            state_machine.handle(&Event::SessionErrorReceived {
+                error,
+                poss_dup: None,
+            });
             return Ok(());
         }
     };
@@ -494,7 +497,10 @@ where
     let mut cb: SessionParserCallback = Default::default();
 
     if let Err(error) = crate::fix::decode::parse(&msg.as_ref()[..], &mut cb) {
-        state_machine.handle(&Event::SessionErrorReceived { error });
+        state_machine.handle(&Event::SessionErrorReceived {
+            error,
+            poss_dup: to_poss_dup_flag(cb.poss_dup_flag),
+        });
         return Ok(());
     };
 
@@ -515,12 +521,18 @@ where
         cb.begin_seq_no,
         cb.end_seq_no,
     ) {
-        state_machine.handle(&Event::SessionErrorReceived { error });
+        state_machine.handle(&Event::SessionErrorReceived {
+            error,
+            poss_dup: to_poss_dup_flag(cb.poss_dup_flag),
+        });
         return Ok(());
     }
 
     if let Err(error) = validate::validate_checksum(&msg) {
-        state_machine.handle(&Event::SessionErrorReceived { error });
+        state_machine.handle(&Event::SessionErrorReceived {
+            error,
+            poss_dup: None,
+        });
         return Ok(());
     }
 
@@ -616,7 +628,8 @@ where
                 to_poss_dup_flag(cb.poss_dup_flag),
             ));
         }
-        None => {
+        // session_type() names only the seven session types matched above.
+        _ => {
             if session::should_pass_app_message(state_machine, msg_seq_num) {
                 let _ = message_received_event_sender.send(Arc::clone(&msg));
             }
@@ -624,15 +637,6 @@ where
                 msg_seq_num,
                 to_poss_dup_flag(cb.poss_dup_flag),
             ));
-        }
-        _ => {
-            let error = SessionError::new_message_rejected(
-                Some(SessionRejectReason::INVALID_MSGTYPE),
-                cb.msg_seq_num,
-                None,
-                None,
-            );
-            state_machine.handle(&Event::SessionErrorReceived { error });
         }
     }
 
@@ -1070,15 +1074,54 @@ mod test {
         msg.into()
     }
 
+    /// PossDupFlag and OrigSendingTime fields that mark a body as a resent copy.
+    fn poss_dup_fields() -> String {
+        let sending_time = Utc::now().format("%Y%m%d-%H:%M:%S%.3f");
+        format!("43=Y\x01122={sending_time}\x01")
+    }
+
+    /// What a session did with a run of inbound messages.
+    struct InboundRun {
+        /// MsgType of every message handed to the app channel, in order.
+        delivered: Vec<String>,
+        /// Every message we wrote to the counterparty, in order, with SOH shown as `|`.
+        sent: Vec<String>,
+        /// The next expected inbound seq afterwards.
+        next_incoming: u32,
+        /// Whether the session ended in the Error state.
+        errored: bool,
+    }
+
+    impl InboundRun {
+        /// The messages of MsgType `msg_type` we wrote to the counterparty.
+        fn sent_of_type(&self, msg_type: &str) -> Vec<&str> {
+            let field = format!("|35={msg_type}|");
+            self.sent
+                .iter()
+                .filter(|msg| msg.contains(&field))
+                .map(String::as_str)
+                .collect()
+        }
+    }
+
+    /// Splits bytes written to the counterparty into messages, SOH shown as `|`.
+    fn split_sent(wire: &[u8]) -> Vec<String> {
+        let text = String::from_utf8_lossy(wire).replace('\x01', "|");
+        let mut messages = Vec::new();
+        let mut rest = text.as_str();
+        while let Some(at) = rest.find("|10=") {
+            let end = at + "|10=000|".len();
+            messages.push(rest[..end].to_owned());
+            rest = &rest[end..];
+        }
+        messages
+    }
+
     /// Runs `msgs` through `handle_msg` on a fresh initiator session that has sent its Logon,
     /// expects inbound seq `next_incoming`, and accepts the extra MsgTypes `accepted`.
-    /// Returns the MsgType of every message handed to the app channel, and the next
-    /// expected inbound seq afterwards.
-    async fn run_inbound(
-        next_incoming: u32,
-        accepted: &[&str],
-        msgs: Vec<MsgBuf>,
-    ) -> (Vec<String>, u32) {
+    /// Flushes the session's outbox to the counterparty after each message, as the session
+    /// loop does, and reports what reached the app and what went out on the wire.
+    async fn run_inbound(next_incoming: u32, accepted: &[&str], msgs: Vec<MsgBuf>) -> InboundRun {
         // Unique per call: tests run in parallel and must not share a store file.
         static STORE_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let store_path = std::env::temp_dir().join(format!(
@@ -1105,27 +1148,48 @@ mod test {
         let mut stream = TcpStream::connect(listener.local_addr().expect("addr"))
             .await
             .expect("connect");
+        let (mut counterparty, _) = listener.accept().await.expect("accept");
         let heartbeat = Duration::from_secs(30);
         let mut fix_timeouts = FixTimeouts::new(heartbeat, heartbeat, heartbeat);
         let (app_tx, mut app_rx) = mpsc::unbounded_channel();
         let mut state_machine = MyStateMachine::new(&settings, (next_incoming, 1));
         state_machine.handle(&Event::Connect(false));
 
-        for msg in msgs {
-            handle_msg(
-                Ok(msg),
+        for msg in std::iter::once(None).chain(msgs.into_iter().map(Some)) {
+            if let Some(msg) = msg {
+                handle_msg(
+                    Ok(msg),
+                    &mut state_machine,
+                    &mut fix_timeouts,
+                    &store,
+                    &settings,
+                    &mut stream,
+                    &NoopLogger,
+                    &additional_headers,
+                    &app_tx,
+                )
+                .await
+                .expect("handle_msg");
+            }
+            send_outgoing_messages(
                 &mut state_machine,
-                &mut fix_timeouts,
-                &store,
-                &settings,
                 &mut stream,
-                &NoopLogger,
                 &additional_headers,
-                &app_tx,
+                &settings,
+                &store,
+                Arc::clone(&settings.epoch),
+                &NoopLogger,
+                &mut fix_timeouts,
             )
             .await
-            .expect("handle_msg");
+            .expect("send_outgoing_messages");
         }
+        drop(stream);
+        let mut wire = Vec::new();
+        counterparty
+            .read_to_end(&mut wire)
+            .await
+            .expect("read sent messages");
 
         let delivered = std::iter::from_fn(|| app_rx.try_recv().ok())
             .map(|msg| {
@@ -1137,7 +1201,12 @@ mod test {
             })
             .collect();
         let _ = std::fs::remove_file(&store_path);
-        (delivered, state_machine.sequences.peek_incoming())
+        InboundRun {
+            delivered,
+            sent: split_sent(&wire),
+            next_incoming: state_machine.sequences.peek_incoming(),
+            errored: session::in_error_state(&state_machine),
+        }
     }
 
     /// A venue-proprietary multi-character type (`35=UMS`) must reach the app like any
@@ -1145,7 +1214,11 @@ mod test {
     /// as garbled without advancing, so every later message (fills included) was lost.
     #[tokio::test]
     async fn multi_character_msg_type_is_delivered_and_advances_inbound_seq() {
-        let (delivered, next_incoming) = run_inbound(
+        let InboundRun {
+            delivered,
+            next_incoming,
+            ..
+        } = run_inbound(
             1,
             &["UMS"],
             vec![
@@ -1167,7 +1240,11 @@ mod test {
     async fn recovers_from_stalled_multi_character_msg_type_via_resend() {
         let sending_time = Utc::now().format("%Y%m%d-%H:%M:%S%.3f");
         let poss_dup = format!("43=Y\x01122={sending_time}\x01");
-        let (delivered, next_incoming) = run_inbound(
+        let InboundRun {
+            delivered,
+            next_incoming,
+            ..
+        } = run_inbound(
             5,
             &["UMS"],
             vec![
@@ -1187,7 +1264,11 @@ mod test {
     /// messages are delivered normally.
     #[tokio::test]
     async fn off_list_msg_type_is_rejected_but_session_keeps_flowing() {
-        let (delivered, next_incoming) = run_inbound(
+        let InboundRun {
+            delivered,
+            next_incoming,
+            ..
+        } = run_inbound(
             1,
             &[],
             vec![
@@ -1205,7 +1286,7 @@ mod test {
     /// any off-list type: the session keeps flowing and later messages are delivered.
     #[tokio::test]
     async fn unconfigured_multi_character_msg_type_is_rejected_but_session_keeps_flowing() {
-        let (delivered, next_incoming) = run_inbound(
+        let run = run_inbound(
             1,
             &[],
             vec![
@@ -1215,8 +1296,25 @@ mod test {
             ],
         )
         .await;
-        assert_eq!(delivered, ["8"]);
-        assert_eq!(next_incoming, 4);
+        assert_eq!(run.delivered, ["8"]);
+        assert_eq!(run.next_incoming, 4);
+        let rejects = run.sent_of_type("3");
+        assert_eq!(
+            rejects.len(),
+            1,
+            "one Reject expected, sent: {:#?}",
+            run.sent
+        );
+        assert!(
+            rejects[0].contains("|45=2|"),
+            "Reject must reference seq 2: {}",
+            rejects[0]
+        );
+        assert!(
+            rejects[0].contains("|372=UMS|"),
+            "Reject must reference UMS: {}",
+            rejects[0]
+        );
     }
 
     /// Resend recovery where the replayed message is NOT accepted: it must be answered
@@ -1227,7 +1325,11 @@ mod test {
     async fn rejected_message_in_resend_range_is_consumed_and_session_recovers() {
         let sending_time = Utc::now().format("%Y%m%d-%H:%M:%S%.3f");
         let poss_dup = format!("43=Y\x01122={sending_time}\x01");
-        let (delivered, next_incoming) = run_inbound(
+        let InboundRun {
+            delivered,
+            next_incoming,
+            ..
+        } = run_inbound(
             5,
             &[],
             vec![
@@ -1240,6 +1342,77 @@ mod test {
         .await;
         assert_eq!(delivered, ["8"]);
         assert_eq!(next_incoming, 22);
+    }
+
+    /// A stale PossDup copy of a message we already received is ignored even when its type
+    /// would be rejected: like any other duplicate it must not move the expected inbound
+    /// seq. Counting it made the next genuine message look too low and logged us out.
+    #[tokio::test]
+    async fn rejected_stale_poss_dup_does_not_advance_inbound_seq() {
+        let run = run_inbound(
+            10,
+            &[],
+            vec![
+                inbound_msg("A", 10, "98=0\x01108=30\x01"),
+                inbound_msg("AE", 5, &format!("{}55=TEST\x01", poss_dup_fields())),
+                inbound_msg("8", 11, "11=order-1\x0139=2\x01150=F\x01"),
+            ],
+        )
+        .await;
+        assert_eq!(run.delivered, ["8"]);
+        assert_eq!(run.next_incoming, 12);
+        assert!(
+            run.sent_of_type("5").is_empty(),
+            "no Logout expected, sent: {:#?}",
+            run.sent
+        );
+        assert!(!run.errored);
+    }
+
+    /// A message that would be rejected but arrives past a sequence gap must trigger a
+    /// ResendRequest for the gap like any other message. It is then rejected once, when its
+    /// replay arrives in order. Counting it on arrival instead skipped the gap: 11 was never
+    /// requested again, so whatever it carried was lost.
+    #[tokio::test]
+    async fn rejected_message_past_a_gap_requests_resend_of_the_gap() {
+        let run = run_inbound(
+            10,
+            &[],
+            vec![
+                inbound_msg("A", 10, "98=0\x01108=30\x01"),
+                inbound_msg("AE", 15, "55=TEST\x01"),
+                inbound_msg("4", 11, &format!("{}123=Y\x0136=15\x01", poss_dup_fields())),
+                inbound_msg("AE", 15, &format!("{}55=TEST\x01", poss_dup_fields())),
+                inbound_msg("8", 16, "11=order-1\x0139=2\x01150=F\x01"),
+            ],
+        )
+        .await;
+        let resend_requests = run.sent_of_type("2");
+        assert_eq!(
+            resend_requests.len(),
+            1,
+            "one ResendRequest expected, sent: {:#?}",
+            run.sent
+        );
+        assert!(
+            resend_requests[0].contains("|7=11|"),
+            "ResendRequest must start at the gap (11): {}",
+            resend_requests[0]
+        );
+        let rejects = run.sent_of_type("3");
+        assert_eq!(
+            rejects.len(),
+            1,
+            "one Reject expected, sent: {:#?}",
+            run.sent
+        );
+        assert!(
+            rejects[0].contains("|45=15|"),
+            "Reject must reference seq 15: {}",
+            rejects[0]
+        );
+        assert_eq!(run.delivered, ["8"]);
+        assert_eq!(run.next_incoming, 17);
     }
 
     #[test]

@@ -58,8 +58,10 @@ pub(super) enum Event {
         test_req_id: Vec<u8>,
         poss_dup: Option<PossDupFlag>,
     },
+    /// `poss_dup` is the PossDupFlag of the message that caused `error`, when it was read.
     SessionErrorReceived {
         error: SessionError,
+        poss_dup: Option<PossDupFlag>,
     },
     ApplicationMessageReceived(u32, Option<PossDupFlag>),
     SendHeartbeat,
@@ -103,6 +105,11 @@ impl Event {
             Event::ApplicationMessageReceived(n, ..) => Some(*n),
             Event::ResendRequestReceived(n, ..) => Some(*n),
             Event::RejectReceived(n, ..) => Some(*n),
+            // A message rejected before its MsgSeqNum was read carries seq 0: unknown.
+            Event::SessionErrorReceived {
+                error: SessionError::MessageRejected { msg_seq_num, .. },
+                ..
+            } if *msg_seq_num != 0 => Some(*msg_seq_num),
             _ => None,
         }
     }
@@ -117,6 +124,7 @@ impl Event {
             Event::ApplicationMessageReceived(.., p) => p,
             Event::ResendRequestReceived(.., p) => p,
             Event::RejectReceived(.., p) => p,
+            Event::SessionErrorReceived { poss_dup, .. } => poss_dup,
             _ => &None,
         };
         poss_dup_flag == &Some(PossDupFlag::YES)
@@ -328,6 +336,7 @@ impl MyStateMachine {
                         text,
                         garbled_msg_type: GarbledMessageType::BeginStringIssue,
                     },
+                ..
             } => {
                 self.outbox_push(build_logout_message_with_text(
                     &self.begin_string,
@@ -337,6 +346,7 @@ impl MyStateMachine {
             }
             Event::SessionErrorReceived {
                 error: SessionError::TcpDisconnection,
+                ..
             } => Response::Transition(State::Error),
             Event::LogoutReceived(..) => {
                 let builder = build_logout_message(&self.begin_string);
@@ -366,25 +376,8 @@ impl MyStateMachine {
         let poss_dup = event.is_poss_dup();
         let sender_comp_id = Arc::clone(&self.sender_comp_id);
         let target_comp_id = Arc::clone(&self.target_comp_id);
-        // A message in the resend range that fails validation is consumed like any other:
-        // answer it with a Reject, exactly as in LoggedIn, and move past it. Otherwise the
-        // range never completes, every later replayed message is skipped as out of order,
-        // and the session stalls.
-        if let Event::SessionErrorReceived {
-            error: error @ SessionError::MessageRejected { msg_seq_num, .. },
-        } = event
-        {
-            if self.rereceive_range.map(|(next, _)| next) == Some(*msg_seq_num) {
-                if let Response::Transition(state) = self.reject_message(error) {
-                    return Response::Transition(state);
-                }
-                return self.advance_resend_range(*msg_seq_num + 1, &return_state);
-            }
-        }
-
-        let (next, end) = match self.rereceive_range.as_mut() {
-            Some(v) => v,
-            None => return Response::Transition(State::Error),
+        let Some((next, end)) = self.rereceive_range else {
+            return Response::Transition(State::Error);
         };
 
         debug!(
@@ -399,6 +392,24 @@ impl MyStateMachine {
             next,
             end
         );
+
+        // A message in the resend range that fails validation is consumed like any other:
+        // answer it with a Reject, exactly as in LoggedIn, and move past it. Otherwise the
+        // range never completes, every later replayed message is skipped as out of order,
+        // and the session stalls.
+        if let Event::SessionErrorReceived {
+            error: error @ SessionError::MessageRejected { msg_seq_num, .. },
+            ..
+        } = event
+        {
+            if *msg_seq_num == next {
+                if let Response::Transition(state) = self.reject_message(error) {
+                    return Response::Transition(state);
+                }
+                return self.advance_resend_range(next + 1, &return_state);
+            }
+        }
+
         if !event.is_poss_dup() {
             if matches!(event, Event::LogoutReceived(..)) {
                 let message = build_logout_message(&self.begin_string);
@@ -426,7 +437,7 @@ impl MyStateMachine {
             return Response::Transition((*return_state).clone());
         }
 
-        if event.get_msg_seq_num() != Some(*next) {
+        if event.get_msg_seq_num() != Some(next) {
             debug!(
                 target: "forgefix_seq",
                 "expecting resends; sender={} target={} state={} event={} skipping unexpected seq; expected_next={} incoming={:?}",
@@ -442,7 +453,7 @@ impl MyStateMachine {
 
         let next_seq_num = match event {
             Event::SequenceResetReceived { new_seq_no, .. } => *new_seq_no,
-            _ => *next + 1,
+            _ => next + 1,
         };
 
         self.advance_resend_range(next_seq_num, &return_state)
@@ -501,6 +512,7 @@ impl MyStateMachine {
         match event {
             Event::SessionErrorReceived {
                 error: SessionError::MissingMsgSeqNum { text },
+                ..
             } => {
                 self.outbox_push(build_logout_message_with_text(
                     &self.begin_string,
@@ -534,13 +546,20 @@ impl MyStateMachine {
             }
             Event::ApplicationMessageReceived(..) => Response::Handled,
             Event::SessionErrorReceived {
-                error: error @ SessionError::MessageRejected { .. },
+                error: error @ SessionError::MessageRejected { msg_seq_num, .. },
+                ..
             } => {
-                self.sequences.incr_incoming();
+                // process_sequence above has already counted a rejected message with a
+                // known seq, or ignored it as a duplicate or gap. One rejected before its
+                // MsgSeqNum was read can't be sequenced, so it counts as the expected one.
+                if *msg_seq_num == 0 {
+                    self.sequences.incr_incoming();
+                }
                 self.reject_message(error)
             }
             Event::SessionErrorReceived {
                 error: SessionError::TcpDisconnection,
+                ..
             } => Response::Transition(State::Error),
             _ => self.post_logon(event),
         }
@@ -605,7 +624,7 @@ impl MyStateMachine {
     }
     fn connected(&mut self, event: &Event) -> Response {
         match event {
-            Event::SessionErrorReceived { error } => match error {
+            Event::SessionErrorReceived { error, .. } => match error {
                 SessionError::GarbledMessage { .. } => {
                     self.send_logon_response(false);
                     Response::Transition(State::Error)
@@ -665,7 +684,7 @@ impl MyStateMachine {
 
                 Response::Transition(State::LoggedIn)
             }
-            Event::SessionErrorReceived { error } => {
+            Event::SessionErrorReceived { error, .. } => {
                 match error {
                     SessionError::MessageRejected { ref_msg_type, .. }
                         if *ref_msg_type == Some(char::from(MsgType::LOGON).to_string()) =>
@@ -849,6 +868,7 @@ mod tests {
         sm
     }
 
+    /// A replayed (PossDup) message at `seq` that failed validation for `reason`.
     fn rejected(seq: u32, reason: SessionRejectReason) -> Event {
         Event::SessionErrorReceived {
             error: SessionError::MessageRejected {
@@ -858,6 +878,7 @@ mod tests {
                 ref_tag_id: None,
                 ref_msg_type: Some(String::from("UMS")),
             },
+            poss_dup: Some(PossDupFlag::YES),
         }
     }
 
