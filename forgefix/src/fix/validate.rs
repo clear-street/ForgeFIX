@@ -1,6 +1,7 @@
 use crate::fix::checksum::checksum_is_valid;
 use crate::fix::generated::{MsgType, SessionRejectReason, Tags};
 use crate::fix::mem::MsgBuf;
+use crate::fix::msg_type::MsgTypeBuf;
 use crate::fix::{GarbledMessageType, SessionError};
 
 use chrono::{DateTime, Duration, Utc};
@@ -9,7 +10,8 @@ use chrono::{DateTime, Duration, Utc};
 pub(super) fn validate_msg<'a>(
     expected_sender_comp_id: &str,
     expected_target_comp_id: &str,
-    msg_type: char,
+    accepted_msg_types: &[MsgTypeBuf],
+    msg_type: MsgTypeBuf,
     msg_seq_num: u32,
     target_comp_id: Option<&'a [u8]>,
     sender_comp_id: Option<&'a [u8]>,
@@ -20,7 +22,10 @@ pub(super) fn validate_msg<'a>(
     begin_seq_no: Option<u32>,
     end_seq_no: Option<u32>,
 ) -> Result<(), SessionError> {
-    if <char as TryInto<MsgType>>::try_into(msg_type).is_err() {
+    // The type must be accepted (the FIX 4.2 set plus the session's configured extras).
+    // Rejecting here is safe: a MessageRejected sends a Reject AND advances the inbound
+    // seq, unlike a framing-level drop, which would stall the session.
+    if !msg_type.is_accepted(accepted_msg_types) {
         return Err(SessionError::new_message_rejected(
             Some(SessionRejectReason::INVALID_MSGTYPE),
             msg_seq_num,
@@ -84,7 +89,8 @@ pub(super) fn validate_msg<'a>(
         }
     }
 
-    if msg_type == MsgType::RESEND_REQUEST.into() && !valid_resend_request(begin_seq_no, end_seq_no)
+    if msg_type.session_type() == Some(MsgType::RESEND_REQUEST)
+        && !valid_resend_request(begin_seq_no, end_seq_no)
     {
         return Err(SessionError::new_message_rejected(
             Some(SessionRejectReason::REQUIRED_TAG_MISSING),
@@ -128,11 +134,11 @@ fn valid_sending_time(sending_time: DateTime<Utc>, sending_time_threshold: Durat
 
 fn validate_duplicate(
     msg_seq_num: u32,
-    msg_type: char,
+    msg_type: MsgTypeBuf,
     sending_time: DateTime<Utc>,
     orig_sending_time: Option<DateTime<Utc>>,
 ) -> Result<(), SessionError> {
-    if msg_type == MsgType::SEQUENCE_RESET.into() {
+    if msg_type.session_type() == Some(MsgType::SEQUENCE_RESET) {
         return Ok(());
     }
     if orig_sending_time.is_none() {

@@ -14,10 +14,9 @@ use thiserror::Error;
 
 use crate::fix::decode::{parse_field, parse_sending_time};
 use crate::fix::encode::{AdditionalHeaders, MessageBuilder, SerializedInt};
-use crate::fix::generated::{
-    is_session_message, GapFillFlag, PossDupFlag, SessionRejectReason, Tags,
-};
+use crate::fix::generated::{GapFillFlag, PossDupFlag, SessionRejectReason, Tags};
 use crate::fix::log::Logger;
+use crate::fix::msg_type::MsgTypeBuf;
 use crate::fix::resend::Transformer;
 use crate::fix::session::{Event, MyStateMachine};
 use crate::fix::stopwatch::FixTimeouts;
@@ -40,6 +39,7 @@ pub mod log;
 pub mod mem;
 
 mod checksum;
+pub(crate) mod msg_type;
 mod resend;
 mod session;
 mod stopwatch;
@@ -73,7 +73,7 @@ pub enum SessionError {
         reject_reason: Option<SessionRejectReason>,
         msg_seq_num: u32,
         ref_tag_id: Option<u32>,
-        ref_msg_type: Option<char>,
+        ref_msg_type: Option<String>,
     },
     #[error("Tried to resend a malformed message")]
     ResendError,
@@ -97,14 +97,16 @@ impl SessionError {
         reason: Option<SessionRejectReason>,
         seq_num: u32,
         tag_id: Option<u32>,
-        msg_type: Option<char>,
+        msg_type: Option<MsgTypeBuf>,
     ) -> SessionError {
         SessionError::MessageRejected {
             text: reason.as_ref().map_or(String::from(""), |r| r.into()),
             reject_reason: reason,
             msg_seq_num: seq_num,
             ref_tag_id: tag_id,
-            ref_msg_type: msg_type,
+            ref_msg_type: msg_type
+                .filter(|t| !t.is_empty())
+                .map(|t| t.as_str().to_owned()),
         }
     }
 
@@ -118,7 +120,7 @@ impl SessionError {
 
 #[derive(Default)]
 struct SessionParserCallback<'a> {
-    msg_type: char,
+    msg_type: MsgTypeBuf,
     msg_seq_num: u32,
     sender_comp_id: Option<&'a [u8]>,
     target_comp_id: Option<&'a [u8]>,
@@ -140,16 +142,15 @@ impl<'a> crate::fix::decode::ParserCallback<'a> for SessionParserCallback<'a> {
     type Err = SessionError;
     fn header(&mut self, key: u32, value: &'a [u8]) -> Result<bool, Self::Err> {
         match key.try_into() {
-            Ok(Tags::MsgType) => {
-                if value.len() == 1 {
-                    self.msg_type = value[0] as char;
-                } else {
+            Ok(Tags::MsgType) => match MsgTypeBuf::from_bytes(value) {
+                Some(msg_type) => self.msg_type = msg_type,
+                None => {
                     return Err(self.create_message_reject(
                         SessionRejectReason::INVALID_MSGTYPE,
                         Tags::MsgType,
                     ));
                 }
-            }
+            },
             Ok(Tags::MsgSeqNum) => {
                 self.msg_seq_num =
                     parse_field::<u32>(value).or(Err(SessionError::MissingMsgSeqNum {
@@ -203,7 +204,7 @@ impl<'a> crate::fix::decode::ParserCallback<'a> for SessionParserCallback<'a> {
     }
 
     fn body(&mut self, key: u32, value: &'a [u8]) -> Result<bool, Self::Err> {
-        if !is_session_message(self.msg_type) {
+        if !self.msg_type.is_session() {
             return Ok(false);
         }
         match key.try_into() {
@@ -483,7 +484,10 @@ where
     let msg = match maybe_msg {
         Ok(b) => Arc::new(b),
         Err(error) => {
-            state_machine.handle(&Event::SessionErrorReceived { error });
+            state_machine.handle(&Event::SessionErrorReceived {
+                error,
+                poss_dup: None,
+            });
             return Ok(());
         }
     };
@@ -493,7 +497,10 @@ where
     let mut cb: SessionParserCallback = Default::default();
 
     if let Err(error) = crate::fix::decode::parse(&msg.as_ref()[..], &mut cb) {
-        state_machine.handle(&Event::SessionErrorReceived { error });
+        state_machine.handle(&Event::SessionErrorReceived {
+            error,
+            poss_dup: to_poss_dup_flag(cb.poss_dup_flag),
+        });
         return Ok(());
     };
 
@@ -502,6 +509,7 @@ where
     if let Err(error) = validate_msg(
         settings.expected_sender_comp_id(),
         settings.expected_target_comp_id(),
+        settings.accepted_msg_types(),
         cb.msg_type,
         cb.msg_seq_num,
         cb.target_comp_id,
@@ -513,22 +521,29 @@ where
         cb.begin_seq_no,
         cb.end_seq_no,
     ) {
-        state_machine.handle(&Event::SessionErrorReceived { error });
+        state_machine.handle(&Event::SessionErrorReceived {
+            error,
+            poss_dup: to_poss_dup_flag(cb.poss_dup_flag),
+        });
         return Ok(());
     }
 
     if let Err(error) = validate::validate_checksum(&msg) {
-        state_machine.handle(&Event::SessionErrorReceived { error });
+        state_machine.handle(&Event::SessionErrorReceived {
+            error,
+            poss_dup: None,
+        });
         return Ok(());
     }
 
     // HANDLE
 
     let msg_seq_num = cb.msg_seq_num;
-    let maybe_msg_type = cb.msg_type.try_into();
-
-    match maybe_msg_type {
-        Ok(LOGON) => {
+    // Only session-level types are interpreted here; anything else is an application
+    // message for the app channel. Validation has already confirmed the type is on the
+    // accepted list, so this arm only sees known application types.
+    match cb.msg_type.session_type() {
+        Some(LOGON) => {
             let mut heartbt_secs = settings.heartbeat_timeout.as_secs() as u32;
             if let Some(i) = cb.heart_bt_int {
                 heartbt_secs = i;
@@ -547,19 +562,19 @@ where
                 to_poss_dup_flag(cb.poss_dup_flag),
             ));
         }
-        Ok(LOGOUT) => {
+        Some(LOGOUT) => {
             state_machine.handle(&Event::LogoutReceived(
                 msg_seq_num,
                 to_poss_dup_flag(cb.poss_dup_flag),
             ));
         }
-        Ok(HEARTBEAT) => {
+        Some(HEARTBEAT) => {
             state_machine.handle(&Event::HeartbeatReceived(
                 msg_seq_num,
                 to_poss_dup_flag(cb.poss_dup_flag),
             ));
         }
-        Ok(SEQUENCE_RESET) => {
+        Some(SEQUENCE_RESET) => {
             if let Some(nsn) = cb.new_seq_no {
                 let maybe_gap_fill = cb
                     .gap_fill
@@ -574,11 +589,11 @@ where
                 })
             }
         }
-        Ok(REJECT) => state_machine.handle(&Event::RejectReceived(
+        Some(REJECT) => state_machine.handle(&Event::RejectReceived(
             msg_seq_num,
             to_poss_dup_flag(cb.poss_dup_flag),
         )),
-        Ok(TEST_REQUEST) => {
+        Some(TEST_REQUEST) => {
             if let Some(test_req_id) = cb.test_req_id {
                 state_machine.handle(&Event::TestRequestReceived {
                     msg_seq_num,
@@ -587,7 +602,7 @@ where
                 })
             }
         }
-        Ok(RESEND_REQUEST) => {
+        Some(RESEND_REQUEST) => {
             let e = match cb.end_seq_no {
                 Some(n) if n > 0 => n,
                 _ => state_machine.sequences.peek_outgoing() - 1,
@@ -613,7 +628,8 @@ where
                 to_poss_dup_flag(cb.poss_dup_flag),
             ));
         }
-        Ok(ref msg_type) if msg_type.is_application() => {
+        // session_type() names only the seven session types matched above.
+        _ => {
             if session::should_pass_app_message(state_machine, msg_seq_num) {
                 let _ = message_received_event_sender.send(Arc::clone(&msg));
             }
@@ -621,15 +637,6 @@ where
                 msg_seq_num,
                 to_poss_dup_flag(cb.poss_dup_flag),
             ));
-        }
-        _ => {
-            let error = SessionError::new_message_rejected(
-                Some(SessionRejectReason::INVALID_MSGTYPE),
-                cb.msg_seq_num,
-                None,
-                None,
-            );
-            state_machine.handle(&Event::SessionErrorReceived { error });
         }
     }
 
@@ -759,9 +766,7 @@ where
     let mut session_msg_count = 0;
     for (_, (msg_seq_num, msg)) in messages.iter().enumerate() {
         let transformer = Transformer::try_from(msg.clone())?;
-        let msg_type =
-            MsgType::try_from(transformer.msg_type).or(Err(SessionError::ResendError))?;
-        if msg_type.is_session() {
+        if transformer.msg_type.is_session() {
             session_msg_count += 1;
             continue;
         }
@@ -1046,6 +1051,386 @@ mod test {
         assert_eq!(raw_data_len, raw_data.len());
         assert!(raw_data.starts_with("7|"));
         assert!(raw_data.contains("|sender|target|30"));
+    }
+
+    struct NoopLogger;
+
+    impl Logger for NoopLogger {
+        fn log_message(&self, _msg: &MsgBuf) -> Result<(), SessionError> {
+            Ok(())
+        }
+    }
+
+    /// An inbound message from the counterparty ("target") to us ("sender"), with a valid
+    /// BodyLength, current SendingTime and CheckSum.
+    fn inbound_msg(msg_type: &str, msg_seq_num: u32, body: &str) -> MsgBuf {
+        let sending_time = Utc::now().format("%Y%m%d-%H:%M:%S%.3f");
+        let rest = format!(
+            "35={msg_type}\x0134={msg_seq_num}\x0149=target\x0152={sending_time}\x0156=sender\x01{body}"
+        );
+        let mut msg = format!("8=FIXT.1.1\x019={}\x01{rest}", rest.len()).into_bytes();
+        let checksum = msg.iter().map(|b| *b as u32).sum::<u32>() % 256;
+        msg.extend_from_slice(format!("10={checksum:03}\x01").as_bytes());
+        msg.into()
+    }
+
+    /// PossDupFlag and OrigSendingTime fields that mark a body as a resent copy.
+    fn poss_dup_fields() -> String {
+        let sending_time = Utc::now().format("%Y%m%d-%H:%M:%S%.3f");
+        format!("43=Y\x01122={sending_time}\x01")
+    }
+
+    /// What a session did with a run of inbound messages.
+    struct InboundRun {
+        /// MsgType of every message handed to the app channel, in order.
+        delivered: Vec<String>,
+        /// Every message we wrote to the counterparty, in order, with SOH shown as `|`.
+        sent: Vec<String>,
+        /// The next expected inbound seq afterwards.
+        next_incoming: u32,
+        /// Whether the session ended in the Error state.
+        errored: bool,
+    }
+
+    impl InboundRun {
+        /// The messages of MsgType `msg_type` we wrote to the counterparty.
+        fn sent_of_type(&self, msg_type: &str) -> Vec<&str> {
+            let field = format!("|35={msg_type}|");
+            self.sent
+                .iter()
+                .filter(|msg| msg.contains(&field))
+                .map(String::as_str)
+                .collect()
+        }
+    }
+
+    /// Splits bytes written to the counterparty into messages, SOH shown as `|`.
+    fn split_sent(wire: &[u8]) -> Vec<String> {
+        let text = String::from_utf8_lossy(wire).replace('\x01', "|");
+        let mut messages = Vec::new();
+        let mut rest = text.as_str();
+        while let Some(at) = rest.find("|10=") {
+            let end = at + "|10=000|".len();
+            messages.push(rest[..end].to_owned());
+            rest = &rest[end..];
+        }
+        messages
+    }
+
+    /// Runs `msgs` through `handle_msg` on a fresh initiator session that has sent its Logon,
+    /// expects inbound seq `next_incoming`, and accepts the extra MsgTypes `accepted`.
+    /// Flushes the session's outbox to the counterparty after each message, as the session
+    /// loop does, and reports what reached the app and what went out on the wire.
+    async fn run_inbound(next_incoming: u32, accepted: &[&str], msgs: Vec<MsgBuf>) -> InboundRun {
+        // Unique per call: tests run in parallel and must not share a store file.
+        static STORE_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let store_path = std::env::temp_dir().join(format!(
+            "forgefix-inbound-{}-{}.db",
+            std::process::id(),
+            STORE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&store_path);
+        let settings = SessionSettings::builder()
+            .with_sender_comp_id("sender")
+            .with_target_comp_id("target")
+            .with_socket_addr("127.0.0.1:9000".parse::<SocketAddr>().expect("socket addr"))
+            .with_store_path(store_path.clone())
+            .with_log_dir(PathBuf::from("/tmp/forgefix-test-logs"))
+            .with_begin_string("FIXT.1.1")
+            .with_accepted_msg_types(accepted)
+            .build()
+            .expect("settings build");
+        let additional_headers = AdditionalHeaders::build(&settings);
+        let store = Store::build(&settings).expect("store");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let mut stream = TcpStream::connect(listener.local_addr().expect("addr"))
+            .await
+            .expect("connect");
+        let (mut counterparty, _) = listener.accept().await.expect("accept");
+        let heartbeat = Duration::from_secs(30);
+        let mut fix_timeouts = FixTimeouts::new(heartbeat, heartbeat, heartbeat);
+        let (app_tx, mut app_rx) = mpsc::unbounded_channel();
+        let mut state_machine = MyStateMachine::new(&settings, (next_incoming, 1));
+        state_machine.handle(&Event::Connect(false));
+
+        for msg in std::iter::once(None).chain(msgs.into_iter().map(Some)) {
+            if let Some(msg) = msg {
+                handle_msg(
+                    Ok(msg),
+                    &mut state_machine,
+                    &mut fix_timeouts,
+                    &store,
+                    &settings,
+                    &mut stream,
+                    &NoopLogger,
+                    &additional_headers,
+                    &app_tx,
+                )
+                .await
+                .expect("handle_msg");
+            }
+            send_outgoing_messages(
+                &mut state_machine,
+                &mut stream,
+                &additional_headers,
+                &settings,
+                &store,
+                Arc::clone(&settings.epoch),
+                &NoopLogger,
+                &mut fix_timeouts,
+            )
+            .await
+            .expect("send_outgoing_messages");
+        }
+        drop(stream);
+        let mut wire = Vec::new();
+        counterparty
+            .read_to_end(&mut wire)
+            .await
+            .expect("read sent messages");
+
+        let delivered = std::iter::from_fn(|| app_rx.try_recv().ok())
+            .map(|msg| {
+                let text = String::from_utf8_lossy(&msg.0).into_owned();
+                text.split('\x01')
+                    .find_map(|field| field.strip_prefix("35="))
+                    .expect("MsgType")
+                    .to_owned()
+            })
+            .collect();
+        let _ = std::fs::remove_file(&store_path);
+        InboundRun {
+            delivered,
+            sent: split_sent(&wire),
+            next_incoming: state_machine.sequences.peek_incoming(),
+            errored: session::in_error_state(&state_machine),
+        }
+    }
+
+    /// A venue-proprietary multi-character type (`35=UMS`) must reach the app like any
+    /// application message and advance the expected inbound seq. Before multi-character MsgType support it was dropped
+    /// as garbled without advancing, so every later message (fills included) was lost.
+    #[tokio::test]
+    async fn multi_character_msg_type_is_delivered_and_advances_inbound_seq() {
+        let InboundRun {
+            delivered,
+            next_incoming,
+            ..
+        } = run_inbound(
+            1,
+            &["UMS"],
+            vec![
+                inbound_msg("A", 1, "98=0\x01108=30\x01"),
+                inbound_msg("UMS", 2, "55=TEST\x01"),
+                inbound_msg("8", 3, "11=order-1\x0139=2\x01150=F\x01"),
+            ],
+        )
+        .await;
+        assert_eq!(delivered, ["UMS", "8"]);
+        assert_eq!(next_incoming, 4);
+    }
+
+    /// Resend recovery with a multi-character type in the replayed range: the session
+    /// expects seq 5, the counterparty logs on at 20 (a gap), we request a resend, and it
+    /// replays the multi-character message as PossDup and gap-fills the rest. The session
+    /// must accept both and catch up without a manual sequence reset.
+    #[tokio::test]
+    async fn recovers_from_stalled_multi_character_msg_type_via_resend() {
+        let sending_time = Utc::now().format("%Y%m%d-%H:%M:%S%.3f");
+        let poss_dup = format!("43=Y\x01122={sending_time}\x01");
+        let InboundRun {
+            delivered,
+            next_incoming,
+            ..
+        } = run_inbound(
+            5,
+            &["UMS"],
+            vec![
+                inbound_msg("A", 20, "98=0\x01108=30\x01"),
+                inbound_msg("UMS", 5, &format!("{poss_dup}55=TEST\x01")),
+                inbound_msg("4", 6, &format!("{poss_dup}123=Y\x0136=21\x01")),
+                inbound_msg("8", 21, "11=order-1\x0139=2\x01150=F\x01"),
+            ],
+        )
+        .await;
+        assert_eq!(delivered, ["UMS", "8"]);
+        assert_eq!(next_incoming, 22);
+    }
+
+    /// A type off the accepted list is rejected at validation — but the rejection still
+    /// advances the inbound seq, so the session keeps flowing (no stall) and later
+    /// messages are delivered normally.
+    #[tokio::test]
+    async fn off_list_msg_type_is_rejected_but_session_keeps_flowing() {
+        let InboundRun {
+            delivered,
+            next_incoming,
+            ..
+        } = run_inbound(
+            1,
+            &[],
+            vec![
+                inbound_msg("A", 1, "98=0\x01108=30\x01"),
+                inbound_msg("z", 2, "58=custom\x01"),
+                inbound_msg("8", 3, "11=order-1\x0139=2\x01150=F\x01"),
+            ],
+        )
+        .await;
+        assert_eq!(delivered, ["8"]);
+        assert_eq!(next_incoming, 4);
+    }
+
+    /// A multi-character type the session was not configured to accept is rejected like
+    /// any off-list type: the session keeps flowing and later messages are delivered.
+    #[tokio::test]
+    async fn unconfigured_multi_character_msg_type_is_rejected_but_session_keeps_flowing() {
+        let run = run_inbound(
+            1,
+            &[],
+            vec![
+                inbound_msg("A", 1, "98=0\x01108=30\x01"),
+                inbound_msg("UMS", 2, "55=TEST\x01"),
+                inbound_msg("8", 3, "11=order-1\x0139=2\x01150=F\x01"),
+            ],
+        )
+        .await;
+        assert_eq!(run.delivered, ["8"]);
+        assert_eq!(run.next_incoming, 4);
+        let rejects = run.sent_of_type("3");
+        assert_eq!(
+            rejects.len(),
+            1,
+            "one Reject expected, sent: {:#?}",
+            run.sent
+        );
+        assert!(
+            rejects[0].contains("|45=2|"),
+            "Reject must reference seq 2: {}",
+            rejects[0]
+        );
+        assert!(
+            rejects[0].contains("|372=UMS|"),
+            "Reject must reference UMS: {}",
+            rejects[0]
+        );
+    }
+
+    /// Resend recovery where the replayed message is NOT accepted: it must be answered
+    /// with a Reject and consumed, so the gap fill that follows completes the range and the
+    /// session catches up. Before, the rejected message never advanced the resend range,
+    /// every later replay was skipped as out of order, and the session stalled.
+    #[tokio::test]
+    async fn rejected_message_in_resend_range_is_consumed_and_session_recovers() {
+        let sending_time = Utc::now().format("%Y%m%d-%H:%M:%S%.3f");
+        let poss_dup = format!("43=Y\x01122={sending_time}\x01");
+        let InboundRun {
+            delivered,
+            next_incoming,
+            ..
+        } = run_inbound(
+            5,
+            &[],
+            vec![
+                inbound_msg("A", 20, "98=0\x01108=30\x01"),
+                inbound_msg("UMS", 5, &format!("{poss_dup}55=TEST\x01")),
+                inbound_msg("4", 6, &format!("{poss_dup}123=Y\x0136=21\x01")),
+                inbound_msg("8", 21, "11=order-1\x0139=2\x01150=F\x01"),
+            ],
+        )
+        .await;
+        assert_eq!(delivered, ["8"]);
+        assert_eq!(next_incoming, 22);
+    }
+
+    /// A stale PossDup copy of a message we already received is ignored even when its type
+    /// would be rejected: like any other duplicate it must not move the expected inbound
+    /// seq. Counting it made the next genuine message look too low and logged us out.
+    #[tokio::test]
+    async fn rejected_stale_poss_dup_does_not_advance_inbound_seq() {
+        let run = run_inbound(
+            10,
+            &[],
+            vec![
+                inbound_msg("A", 10, "98=0\x01108=30\x01"),
+                inbound_msg("AE", 5, &format!("{}55=TEST\x01", poss_dup_fields())),
+                inbound_msg("8", 11, "11=order-1\x0139=2\x01150=F\x01"),
+            ],
+        )
+        .await;
+        assert_eq!(run.delivered, ["8"]);
+        assert_eq!(run.next_incoming, 12);
+        assert!(
+            run.sent_of_type("5").is_empty(),
+            "no Logout expected, sent: {:#?}",
+            run.sent
+        );
+        assert!(!run.errored);
+    }
+
+    /// A message that would be rejected but arrives past a sequence gap must trigger a
+    /// ResendRequest for the gap like any other message. It is then rejected once, when its
+    /// replay arrives in order. Counting it on arrival instead skipped the gap: 11 was never
+    /// requested again, so whatever it carried was lost.
+    #[tokio::test]
+    async fn rejected_message_past_a_gap_requests_resend_of_the_gap() {
+        let run = run_inbound(
+            10,
+            &[],
+            vec![
+                inbound_msg("A", 10, "98=0\x01108=30\x01"),
+                inbound_msg("AE", 15, "55=TEST\x01"),
+                inbound_msg("4", 11, &format!("{}123=Y\x0136=15\x01", poss_dup_fields())),
+                inbound_msg("AE", 15, &format!("{}55=TEST\x01", poss_dup_fields())),
+                inbound_msg("8", 16, "11=order-1\x0139=2\x01150=F\x01"),
+            ],
+        )
+        .await;
+        let resend_requests = run.sent_of_type("2");
+        assert_eq!(
+            resend_requests.len(),
+            1,
+            "one ResendRequest expected, sent: {:#?}",
+            run.sent
+        );
+        assert!(
+            resend_requests[0].contains("|7=11|"),
+            "ResendRequest must start at the gap (11): {}",
+            resend_requests[0]
+        );
+        let rejects = run.sent_of_type("3");
+        assert_eq!(
+            rejects.len(),
+            1,
+            "one Reject expected, sent: {:#?}",
+            run.sent
+        );
+        assert!(
+            rejects[0].contains("|45=15|"),
+            "Reject must reference seq 15: {}",
+            rejects[0]
+        );
+        assert_eq!(run.delivered, ["8"]);
+        assert_eq!(run.next_incoming, 17);
+    }
+
+    #[test]
+    fn invalid_accepted_msg_type_fails_at_build() {
+        for bad in ["", "ABCDE", "U S", "U\u{1}S"] {
+            let result = SessionSettings::builder()
+                .with_sender_comp_id("sender")
+                .with_target_comp_id("target")
+                .with_socket_addr("127.0.0.1:9000".parse::<SocketAddr>().expect("socket addr"))
+                .with_store_path(PathBuf::from("/tmp/forgefix-test-store.db"))
+                .with_log_dir(PathBuf::from("/tmp/forgefix-test-logs"))
+                .with_accepted_msg_types([bad])
+                .build();
+            assert!(matches!(
+                result,
+                Err(crate::ApplicationError::InvalidSetting(_))
+            ));
+        }
     }
 
     #[tokio::test]

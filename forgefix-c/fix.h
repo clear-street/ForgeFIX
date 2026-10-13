@@ -19,6 +19,7 @@ typedef enum c_fix_error {
   C_FIX_ERROR_BAD_STRING,
   C_FIX_ERROR_SETTING_REQUIRED,
   C_FIX_ERROR_UNKNOWN,
+  C_FIX_ERROR_INVALID_SETTING,
 } c_fix_error;
 
 typedef struct BlockingFixApplicationClient BlockingFixApplicationClient;

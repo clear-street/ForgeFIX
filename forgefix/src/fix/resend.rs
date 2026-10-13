@@ -1,6 +1,7 @@
 use crate::fix::checksum::AsyncChecksumWriter;
 use crate::fix::decode::ParsedPeek;
 use crate::fix::encode::{SerializedInt, SOH, TIME_FORMAT};
+use crate::fix::msg_type::MsgTypeBuf;
 use crate::fix::SessionError;
 use anyhow::Result;
 use chrono::offset::Utc;
@@ -14,7 +15,7 @@ pub(super) struct Transformer {
     sending_time_start: usize,
     sending_time_end: usize,
     fixed_fields_end: usize,
-    pub msg_type: char,
+    pub msg_type: MsgTypeBuf,
 }
 
 const POSS_DUP_FLAG_EQ_Y: &[u8] = b"43=Y\x01";
@@ -133,6 +134,28 @@ mod test {
     fn test_poss_dup_flag_const() {
         let sum: i32 = POSS_DUP_FLAG_EQ_Y.iter().map(|c| *c as i32).sum();
         assert_eq!(sum, POSS_DUP_FLAG_EQ_Y_CHECKSUM);
+    }
+
+    /// A stored multi-character-type message (such as `UMS`) must survive
+    /// a resend: Transformer re-parses it (pre-fix this failed as garbled, aborting the
+    /// whole resend) and it is not a session type, so `resend_messages` resends it rather
+    /// than replacing it with a gap fill.
+    #[tokio::test]
+    async fn test_transformer_multi_character_msg_type() {
+        let orig =
+            b"8=FIXT.1.1\x019=48\x0135=UMS\x0152=20230808-13:19:54.537\x0134=7\x0155=TEST\x0110=000\x01";
+        let t: Transformer = orig.to_vec().try_into().expect("parse stored UMS");
+        assert_eq!(t.msg_type.as_str(), "UMS");
+        assert!(!t.msg_type.is_session());
+
+        let mut buf = Vec::new();
+        let mut cur = tokio::io::BufWriter::new(&mut buf);
+        t.build_async(&mut cur).await.expect("building");
+        cur.flush().await.unwrap();
+        let out = String::from_utf8(buf).expect("utf8");
+        assert!(out.contains("35=UMS\x01"));
+        assert!(out.contains("43=Y\x01"));
+        assert!(out.contains("122=20230808-13:19:54.537\x01"));
     }
 
     #[tokio::test]

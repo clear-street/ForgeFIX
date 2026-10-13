@@ -304,6 +304,30 @@ mod test {
     }
 
     #[tokio::test]
+    async fn test_read_message_with_multi_character_msg_type() {
+        // A venue-proprietary multi-character type (35=UMS), framed as on the wire. The
+        // header peek used to require a one-byte MsgType and threw this away as garbled.
+        let rest = "35=UMS\x0134=5\x0149=VENUE\x0152=20230808-13:19:54.537\x0156=sender\x01\
+                    55=TEST\x01";
+        let mut msg = format!("8=FIXT.1.1\x019={}\x01{rest}", rest.len()).into_bytes();
+        let checksum = msg.iter().map(|b| *b as u32).sum::<u32>() % 256;
+        msg.extend_from_slice(format!("10={checksum:03}\x01").as_bytes());
+
+        let mut incoming_message = Cursor::new(msg.as_slice());
+        let mut header_buf = HeaderBuf::<{ PEEK_LEN }>::new();
+        assert!(read_header(&mut incoming_message, &mut header_buf)
+            .await
+            .is_ok());
+        assert_eq!(
+            read_message(&mut incoming_message, &mut header_buf, &MockLogger)
+                .await
+                .unwrap()
+                .0,
+            msg,
+        );
+    }
+
+    #[tokio::test]
     async fn test_read_message() {
         let mock_logger = MockLogger;
         let mut incoming_message = Cursor::new(b"8=FIX.4.2\x019=67\x0135=A\x0134=1\x0149=ISLD\x0152=20240506-13:59:15.021\x0156=TW\x0198=0\x01108=30\x01141=Y\x0110=003\x01".as_slice());

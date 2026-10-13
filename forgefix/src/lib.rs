@@ -109,6 +109,7 @@ pub mod fix;
 use fix::encode::MessageBuilder;
 use fix::log::{FileLogger, Logger};
 use fix::mem::MsgBuf;
+use fix::msg_type::{MsgTypeBuf, MSG_TYPE_MAX};
 
 use std::io;
 use std::net::SocketAddr;
@@ -165,6 +166,8 @@ pub enum ApplicationError {
     SetSequenceNumbersFailed,
     #[error("setting `{0}` is required")]
     SettingRequired(String),
+    #[error("invalid setting: {0}")]
+    InvalidSetting(String),
 }
 
 /// Context available when customizing an outbound initiator `Logon<A>`.
@@ -206,6 +209,7 @@ pub struct SessionSettings {
     start_time: NaiveTime,
     session_start_instant: Option<DateTime<Utc>>,
     initiator_logon_hook: Option<Arc<dyn InitiatorLogonHook>>,
+    accepted_msg_types: Arc<[MsgTypeBuf]>,
 }
 
 /// A builder for easily configuring all the fields of a [`SessionSettings`]
@@ -230,6 +234,7 @@ pub struct SessionSettingsBuilder {
     start_time: Option<NaiveTime>,
     session_start_instant: Option<DateTime<Utc>>,
     initiator_logon_hook: Option<Arc<dyn InitiatorLogonHook>>,
+    accepted_msg_types: Vec<String>,
 }
 
 impl SessionSettingsBuilder {
@@ -357,10 +362,39 @@ impl SessionSettingsBuilder {
         self.initiator_logon_hook = Some(initiator_logon_hook);
     }
 
+    /// Extra `MsgType(35)` values to accept on inbound messages, in addition to the
+    /// FIX 4.2 set. Use this for counterparty-specific types, such as multi-character
+    /// proprietary ones. Inbound types outside the accepted set are answered with a
+    /// session `Reject<3>` and the session continues.
+    ///
+    /// Each value must be 1 to 4 printable ASCII bytes; [`build`] fails otherwise, so a
+    /// misconfigured value is caught at startup instead of silently never matching.
+    ///
+    /// [`build`]: SessionSettingsBuilder::build
+    pub fn with_accepted_msg_types<I, S>(mut self, msg_types: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.set_accepted_msg_types(msg_types);
+        self
+    }
+    pub fn set_accepted_msg_types<I, S>(&mut self, msg_types: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.accepted_msg_types = msg_types
+            .into_iter()
+            .map(|t| t.as_ref().to_string())
+            .collect();
+    }
+
     /// Build the [`SessionSettings`] struct.
     ///
     /// Returns an `Err(ApplicationError::SettingRequired)` if not all of the required fields
-    /// were set.
+    /// were set, or an `Err(ApplicationError::InvalidSetting)` if an accepted MsgType is
+    /// empty, longer than 4 bytes, or not printable ASCII.
     pub fn build(self) -> Result<SessionSettings, ApplicationError> {
         let sender_comp_id = self
             .sender_comp_id
@@ -381,6 +415,23 @@ impl SessionSettingsBuilder {
         let log_dir = self
             .log_dir
             .ok_or(ApplicationError::SettingRequired("log_dir".to_string()))?;
+        let accepted_msg_types = self
+            .accepted_msg_types
+            .iter()
+            .map(|t| {
+                // A value the wire can never carry (it is separator-delimited printable
+                // ASCII) would make the entry silently inert; fail loudly at startup.
+                let printable = t.as_bytes().iter().all(u8::is_ascii_graphic);
+                printable
+                    .then(|| MsgTypeBuf::from_bytes(t.as_bytes()))
+                    .flatten()
+                    .ok_or_else(|| {
+                        ApplicationError::InvalidSetting(format!(
+                            "accepted MsgType {t:?} must be 1 to {MSG_TYPE_MAX} printable ASCII bytes"
+                        ))
+                    })
+            })
+            .collect::<Result<Arc<[MsgTypeBuf]>, _>>()?;
 
         Ok(SessionSettings {
             engine_type: FixEngineType::Client,
@@ -399,6 +450,7 @@ impl SessionSettingsBuilder {
             store_path,
             log_dir,
             initiator_logon_hook: self.initiator_logon_hook,
+            accepted_msg_types,
         })
     }
 }
@@ -438,6 +490,10 @@ impl SessionSettings {
 
     fn expected_target_comp_id(&self) -> &str {
         &self.sender_comp_id
+    }
+
+    fn accepted_msg_types(&self) -> &[MsgTypeBuf] {
+        &self.accepted_msg_types
     }
 }
 

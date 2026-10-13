@@ -22,6 +22,8 @@ pub enum CFixError {
     BadString,
     SettingRequired,
     Unknown,
+    // Appended, not inserted, so existing C error codes keep their numeric values.
+    InvalidSetting,
 }
 
 impl<T> From<Result<T, ApplicationError>> for CFixError {
@@ -35,6 +37,7 @@ impl<T> From<Result<T, ApplicationError>> for CFixError {
             Err(ApplicationError::SendMessageFailed) => CFixError::SendMessageFailed,
             Err(ApplicationError::SetSequenceNumbersFailed) => CFixError::SetSequenceNumbersFailed,
             Err(ApplicationError::SettingRequired(..)) => CFixError::SettingRequired,
+            Err(ApplicationError::InvalidSetting(..)) => CFixError::InvalidSetting,
         }
     }
 }

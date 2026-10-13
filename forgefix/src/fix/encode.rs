@@ -34,6 +34,7 @@
 
 use crate::fix::checksum::AsyncChecksumWriter;
 use crate::fix::generated::Tags;
+use crate::fix::msg_type::MsgTypeBuf;
 use crate::SessionSettings;
 use chrono::{DateTime, Utc};
 use std::io::{Cursor, Write};
@@ -93,40 +94,6 @@ pub struct MessageBuilder {
 }
 
 pub(super) const SOH: &[u8] = &[b'\x01'];
-const MSG_TYPE_MAX: usize = 4;
-
-#[derive(Clone, Copy, Debug)]
-struct MsgTypeBuf {
-    buf: [u8; MSG_TYPE_MAX],
-    len: u8,
-}
-
-impl MsgTypeBuf {
-    fn new(msg_type: &str) -> Self {
-        let bytes = msg_type.as_bytes();
-        assert!(
-            bytes.len() <= MSG_TYPE_MAX,
-            "MsgType length {} exceeds {}",
-            bytes.len(),
-            MSG_TYPE_MAX
-        );
-        let mut buf = [0u8; MSG_TYPE_MAX];
-        buf[..bytes.len()].copy_from_slice(bytes);
-        Self {
-            buf,
-            len: bytes.len() as u8,
-        }
-    }
-
-    fn as_str(&self) -> &str {
-        std::str::from_utf8(&self.buf[..self.len as usize]).unwrap_or("")
-    }
-
-    fn len(&self) -> usize {
-        self.len as usize
-    }
-}
-
 impl MessageBuilder {
     /// Creates a new [`MessageBuilder`] with `begin_string` and a single-character `msg_type`.
     /// It is helpful to use [`MsgType`] variants for `msg_type`.

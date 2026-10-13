@@ -156,6 +156,7 @@
 //! ```
 
 use crate::fix::generated::{get_data_ref, Tags};
+use crate::fix::msg_type::{MsgTypeBuf, MSG_TYPE_MAX};
 use crate::fix::{GarbledMessageType, SessionError};
 use chrono::{DateTime, NaiveDateTime, Utc};
 use lazy_static::lazy_static;
@@ -452,7 +453,7 @@ pub(super) fn parse_header(header: &[u8]) -> Result<usize, SessionError> {
 }
 
 pub(super) struct ParsedPeek {
-    pub msg_type: char,
+    pub msg_type: MsgTypeBuf,
     pub len_start: usize,
     pub len_end: usize,
     pub fixed_fields_end: usize,
@@ -532,18 +533,28 @@ pub(super) fn parse_peeked_prefix(peeked: &[u8]) -> result::Result<ParsedPeek, S
         ));
     }
 
-    let msg_type = if &peeked[at..at + 3] == b"35=" && peeked[at + 4] == b'\x01' {
-        peeked[at + 3]
-    } else {
-        return Err(SessionError::new_garbled_message(
+    // MsgType is a String: scan to its SOH rather than assuming one character.
+    let missing_msg_type = || {
+        SessionError::new_garbled_message(
             String::from("Missing MsgType"),
             GarbledMessageType::MsgTypeIssue,
-        ));
+        )
     };
-    let fixed_fields_end = at + 5;
+    if peeked.get(at..at + 3) != Some(b"35=".as_slice()) {
+        return Err(missing_msg_type());
+    }
+    let value_start = at + 3;
+    let value_len = peeked[value_start..]
+        .iter()
+        .take(MSG_TYPE_MAX + 1)
+        .position(|b| *b == b'\x01')
+        .ok_or_else(missing_msg_type)?;
+    let msg_type = MsgTypeBuf::from_bytes(&peeked[value_start..value_start + value_len])
+        .ok_or_else(missing_msg_type)?;
+    let fixed_fields_end = value_start + value_len + 1;
 
     Ok(ParsedPeek {
-        msg_type: msg_type as char,
+        msg_type,
         len_start,
         len_end,
         fixed_fields_end,
@@ -641,10 +652,44 @@ mod test {
     #[test]
     fn test_parse_peeked_prefix_accepts_fixt_begin_string() {
         let parsed = parse_peeked_prefix(b"8=FIXT.1.1\x019=57\x0135=A\x0134=1\x0149=ISLD").unwrap();
-        assert_eq!(parsed.msg_type, 'A');
+        assert_eq!(parsed.msg_type.as_str(), "A");
         assert_eq!(parsed.len_start, 13);
         assert_eq!(parsed.len_end, 15);
         assert_eq!(parsed.body_length, 57);
+    }
+
+    #[test]
+    fn test_parse_peeked_prefix_accepts_multi_character_msg_type() {
+        // A venue-proprietary multi-character type, as seen on the wire.
+        let parsed =
+            parse_peeked_prefix(b"8=FIXT.1.1\x019=552\x0135=UMS\x0134=5\x0149=VENUE").unwrap();
+        assert_eq!(parsed.msg_type.as_str(), "UMS");
+        assert_eq!(parsed.body_length, 552);
+        assert_eq!(
+            parsed.fixed_fields_end,
+            b"8=FIXT.1.1\x019=552\x0135=UMS\x01".len()
+        );
+
+        let parsed = parse_peeked_prefix(b"8=FIXT.1.1\x019=99\x0135=AE\x0134=7\x01").unwrap();
+        assert_eq!(parsed.msg_type.as_str(), "AE");
+    }
+
+    #[test]
+    fn test_parse_peeked_prefix_rejects_bad_msg_type() {
+        for peeked in [
+            &b"8=FIX.4.2\x019=5\x0135=\x0134=1\x01"[..],
+            b"8=FIX.4.2\x019=5\x0135=ABCDE\x0134=1\x01",
+            b"8=FIX.4.2\x019=5\x0135=UMS",
+            b"8=FIX.4.2\x019=5\x0134=1\x0135=D\x01",
+        ] {
+            assert!(matches!(
+                parse_peeked_prefix(peeked),
+                Err(SessionError::GarbledMessage {
+                    garbled_msg_type: GarbledMessageType::MsgTypeIssue,
+                    ..
+                })
+            ));
+        }
     }
 
     #[test]
