@@ -150,33 +150,31 @@ enum Request {
 }
 
 /// How a queued outbound message reports its result to the application.
-enum SendAck {
-    /// Yields whether the message was sent.
-    Sent(oneshot::Sender<bool>),
-    /// Yields the `MsgSeqNum(34)` the message was sent with, or `None` if it was not sent.
-    SeqNum(oneshot::Sender<Option<u32>>),
+struct SendAck {
+    resp_sender: oneshot::Sender<bool>,
+    on_sent: Option<Box<dyn FnOnce(u32) + Send + Sync>>,
 }
 
 impl SendAck {
-    fn sent(self, msg_seq_num: u32) {
-        match self {
-            SendAck::Sent(resp_sender) => {
-                let _ = resp_sender.send(true);
-            }
-            SendAck::SeqNum(resp_sender) => {
-                let _ = resp_sender.send(Some(msg_seq_num));
-            }
+    fn new(resp_sender: oneshot::Sender<bool>) -> Self {
+        Self {
+            resp_sender,
+            on_sent: None,
         }
     }
-    fn failed(self) {
-        match self {
-            SendAck::Sent(resp_sender) => {
-                let _ = resp_sender.send(false);
-            }
-            SendAck::SeqNum(resp_sender) => {
-                let _ = resp_sender.send(None);
-            }
+    /// Run the `on_sent` hook with the `MsgSeqNum(34)` the message was sent with, and return
+    /// the sender that reports the result.
+    fn notify_sent(self, msg_seq_num: u32) -> oneshot::Sender<bool> {
+        if let Some(on_sent) = self.on_sent {
+            on_sent(msg_seq_num);
         }
+        self.resp_sender
+    }
+    fn sent(self, msg_seq_num: u32) {
+        let _ = self.notify_sent(msg_seq_num).send(true);
+    }
+    fn failed(self) {
+        let _ = self.resp_sender.send(false);
     }
 }
 
@@ -696,7 +694,7 @@ impl FixApplicationHandle {
         }
         let (resp_sender, resp_receiver) = oneshot::channel();
         let send_message_request = Request::SendMessage {
-            resp_sender: SendAck::Sent(resp_sender),
+            resp_sender: SendAck::new(resp_sender),
             builder,
         };
         let _ = self.request_sender.send(send_message_request);
@@ -723,53 +721,65 @@ impl FixApplicationHandle {
         Ok(())
     }
 
-    /// Like [`send_message`], but the receiver yields the `MsgSeqNum(34)` the message was sent
-    /// with, or `None` if it cannot be sent.
+    /// Like [`send_message`], and once the message is sent the engine calls `on_sent` with the
+    /// `MsgSeqNum(34)` it was sent with. `on_sent` is not called if the message cannot be sent.
     ///
     /// A peer's session-level `Reject<3>` identifies the message it rejects only by
     /// `RefSeqNum(45)`, so this is how an application correlates such rejects (see
-    /// [`SessionSettingsBuilder::with_forward_session_rejects`]).
+    /// [`SessionSettingsBuilder::with_forward_session_rejects`]). The engine calls `on_sent`
+    /// before it handles anything it receives afterwards, so whatever `on_sent` records is in
+    /// place before the peer's reject of the message reaches the application. `on_sent` runs on
+    /// the engine's task and must not block.
     ///
     /// [`send_message`]: FixApplicationHandle::send_message
     pub fn send_message_with_seq_num(
         &self,
         builder: MessageBuilder,
-    ) -> Result<oneshot::Receiver<Option<u32>>, ApplicationError> {
+        on_sent: impl FnOnce(u32) + Send + Sync + 'static,
+    ) -> Result<oneshot::Receiver<bool>, ApplicationError> {
         if self.request_sender.is_closed() {
             return Err(ApplicationError::SessionEnded);
         }
         let (resp_sender, resp_receiver) = oneshot::channel();
         let send_message_request = Request::SendMessage {
-            resp_sender: SendAck::SeqNum(resp_sender),
+            resp_sender: SendAck {
+                resp_sender,
+                on_sent: Some(Box::new(on_sent)),
+            },
             builder,
         };
         let _ = self.request_sender.send(send_message_request);
         Ok(resp_receiver)
     }
-    /// Send the message in `builder` and await the `MsgSeqNum(34)` it was sent with.
+    /// Send the message in `builder`, calling `on_sent` as [`send_message_with_seq_num`] does,
+    /// and await asynchronously.
+    ///
+    /// [`send_message_with_seq_num`]: FixApplicationHandle::send_message_with_seq_num
     pub async fn send_message_with_seq_num_async(
         &self,
         builder: MessageBuilder,
-    ) -> Result<u32, ApplicationError> {
-        let resp_receiver = self.send_message_with_seq_num(builder)?;
-        resp_receiver
-            .await
-            .ok()
-            .flatten()
-            .ok_or(ApplicationError::SendMessageFailed)
+        on_sent: impl FnOnce(u32) + Send + Sync + 'static,
+    ) -> Result<(), ApplicationError> {
+        let resp_receiver = self.send_message_with_seq_num(builder, on_sent)?;
+        if Ok(true) != resp_receiver.await {
+            return Err(ApplicationError::SendMessageFailed);
+        }
+        Ok(())
     }
-    /// Send the message in `builder` and block until the `MsgSeqNum(34)` it was sent with is
-    /// returned.
+    /// Send the message in `builder`, calling `on_sent` as [`send_message_with_seq_num`] does,
+    /// and block until a result is returned.
+    ///
+    /// [`send_message_with_seq_num`]: FixApplicationHandle::send_message_with_seq_num
     pub fn send_message_with_seq_num_sync(
         &self,
         builder: MessageBuilder,
-    ) -> Result<u32, ApplicationError> {
-        let resp_receiver = self.send_message_with_seq_num(builder)?;
-        resp_receiver
-            .blocking_recv()
-            .ok()
-            .flatten()
-            .ok_or(ApplicationError::SendMessageFailed)
+        on_sent: impl FnOnce(u32) + Send + Sync + 'static,
+    ) -> Result<(), ApplicationError> {
+        let resp_receiver = self.send_message_with_seq_num(builder, on_sent)?;
+        if Ok(true) != resp_receiver.blocking_recv() {
+            return Err(ApplicationError::SendMessageFailed);
+        }
+        Ok(())
     }
 
     /// Send a request to the engine to set sequence numbers and return immediately.

@@ -440,7 +440,7 @@ fn handle_req(
             let begin_string = Arc::clone(&state_machine.begin_string);
             state_machine.outbox_push_with_sender(
                 crate::fix::session::build_logout_message(&begin_string),
-                SendAck::Sent(resp_sender),
+                SendAck::new(resp_sender),
             );
         }
         Request::Logon { resp_sender } => {
@@ -748,10 +748,9 @@ where
 
         if is_logout {
             state_machine.outbox_clear();
-            state_machine.set_logout_resp_sender(match maybe_resp_sender {
-                Some(SendAck::Sent(resp_sender)) => Some(resp_sender),
-                _ => None,
-            });
+            state_machine.set_logout_resp_sender(
+                maybe_resp_sender.map(|resp_sender| resp_sender.notify_sent(msg_seq_num)),
+            );
             state_machine.handle(&Event::LogoutSent);
             fix_timeouts.start_logout_timeout();
             break;

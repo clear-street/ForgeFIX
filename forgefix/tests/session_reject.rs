@@ -2,7 +2,8 @@
 //! These tests run an initiator against an acceptor over localhost TCP.
 
 use std::net::{SocketAddr, TcpListener};
-use std::sync::Arc;
+use std::str;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use forgefix::fix::encode::{MessageBuilder, SerializedInt};
@@ -14,6 +15,7 @@ use forgefix::{
 };
 use tempfile::TempDir;
 use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::oneshot;
 use tokio::time::timeout;
 
 const RECV_TIMEOUT: Duration = Duration::from_secs(5);
@@ -81,7 +83,7 @@ async fn connect(forward_session_rejects: bool) -> (Peer, Peer) {
 
 fn field(msg: &MsgBuf, tag: u32) -> Option<&str> {
     let prefix = format!("{tag}=");
-    std::str::from_utf8(&msg.0)
+    str::from_utf8(&msg.0)
         .ok()?
         .split('\x01')
         .find_map(|field| field.strip_prefix(prefix.as_str()))
@@ -94,23 +96,40 @@ async fn recv(peer: &mut Peer) -> Arc<MsgBuf> {
         .expect("channel open")
 }
 
-/// Send a `QuoteRequest<R>` from the initiator, and have the acceptor reject it with a
-/// `Reject<3>` referencing the `MsgSeqNum(34)` it arrived with.
-async fn send_request_and_reject(initiator: &Peer, acceptor: &mut Peer) -> u32 {
+/// A request the initiator sent, and the acceptor's `Reject<3>` of it.
+struct RejectedRequest {
+    /// The `MsgSeqNum(34)` the request arrived with.
+    seq_num: u32,
+    /// What the request's `on_sent` hook was called with.
+    on_sent_seq_num: Arc<OnceLock<u32>>,
+    /// The request's send result, not yet awaited.
+    sent: oneshot::Receiver<bool>,
+}
+
+/// Send a `QuoteRequest<R>` from the initiator without awaiting its send result, and have the
+/// acceptor reject it with a `Reject<3>` referencing the `MsgSeqNum(34)` it arrived with.
+async fn send_request_and_reject(initiator: &Peer, acceptor: &mut Peer) -> RejectedRequest {
     let request = MessageBuilder::new(
         &initiator.handle.begin_string(),
         MsgType::QUOTE_REQUEST.into(),
     )
     .push(Tags::QuoteReqID, b"LOCATE-1");
-    let seq_num = initiator
-        .handle
-        .send_message_with_seq_num_async(request)
-        .await
-        .expect("request sent");
+    let on_sent_seq_num = Arc::new(OnceLock::new());
+    let sent = {
+        let on_sent_seq_num = Arc::clone(&on_sent_seq_num);
+        initiator
+            .handle
+            .send_message_with_seq_num(request, move |seq_num| {
+                on_sent_seq_num.set(seq_num).expect("on_sent runs once");
+            })
+            .expect("request queued")
+    };
 
     let received = recv(acceptor).await;
     assert_eq!(field(&received, 35), Some("R"));
-    assert_eq!(field(&received, 34), Some(seq_num.to_string().as_str()));
+    let seq_num = field(&received, 34)
+        .and_then(|seq_num| seq_num.parse().ok())
+        .expect("MsgSeqNum");
 
     let reject = MessageBuilder::new(&acceptor.handle.begin_string(), MsgType::REJECT.into())
         .push(Tags::RefSeqNum, SerializedInt::from(seq_num).as_bytes())
@@ -121,19 +140,28 @@ async fn send_request_and_reject(initiator: &Peer, acceptor: &mut Peer) -> u32 {
         .send_message_async(reject)
         .await
         .expect("reject sent");
-    seq_num
+    RejectedRequest {
+        seq_num,
+        on_sent_seq_num,
+        sent,
+    }
 }
 
 #[tokio::test]
-async fn forwarded_session_reject_references_the_returned_seq_num() {
+async fn forwarded_session_reject_arrives_after_on_sent_recorded_its_seq_num() {
     let (mut initiator, mut acceptor) = connect(true).await;
 
-    let seq_num = send_request_and_reject(&initiator, &mut acceptor).await;
+    let request = send_request_and_reject(&initiator, &mut acceptor).await;
 
     let reject = recv(&mut initiator).await;
+    assert_eq!(request.on_sent_seq_num.get(), Some(&request.seq_num));
     assert_eq!(field(&reject, 35), Some("3"));
-    assert_eq!(field(&reject, 45), Some(seq_num.to_string().as_str()));
+    assert_eq!(
+        field(&reject, 45),
+        Some(request.seq_num.to_string().as_str())
+    );
     assert_eq!(field(&reject, 372), Some("R"));
+    assert_eq!(request.sent.await, Ok(true));
 }
 
 #[tokio::test]
