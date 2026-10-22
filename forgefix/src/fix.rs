@@ -21,7 +21,7 @@ use crate::fix::resend::Transformer;
 use crate::fix::session::{Event, MyStateMachine};
 use crate::fix::stopwatch::FixTimeouts;
 use crate::fix::validate::validate_msg;
-use crate::{FixEngineType, InitiatorLogonContext, Request, SessionSettings};
+use crate::{FixEngineType, InitiatorLogonContext, Request, SendAck, SessionSettings};
 use store::Store;
 
 use generated::MsgType;
@@ -440,7 +440,7 @@ fn handle_req(
             let begin_string = Arc::clone(&state_machine.begin_string);
             state_machine.outbox_push_with_sender(
                 crate::fix::session::build_logout_message(&begin_string),
-                resp_sender,
+                SendAck::new(resp_sender),
             );
         }
         Request::Logon { resp_sender } => {
@@ -589,10 +589,17 @@ where
                 })
             }
         }
-        Some(REJECT) => state_machine.handle(&Event::RejectReceived(
-            msg_seq_num,
-            to_poss_dup_flag(cb.poss_dup_flag),
-        )),
+        Some(REJECT) => {
+            if settings.forward_session_rejects
+                && session::should_pass_app_message(state_machine, msg_seq_num)
+            {
+                let _ = message_received_event_sender.send(Arc::clone(&msg));
+            }
+            state_machine.handle(&Event::RejectReceived(
+                msg_seq_num,
+                to_poss_dup_flag(cb.poss_dup_flag),
+            ))
+        }
         Some(TEST_REQUEST) => {
             if let Some(test_req_id) = cb.test_req_id {
                 state_machine.handle(&Event::TestRequestReceived {
@@ -683,7 +690,7 @@ async fn receive_logon_request(
                 return Some(resp_sender);
             }
             Some(Request::SendMessage { resp_sender, .. }) => {
-                let _ = resp_sender.send(false);
+                resp_sender.failed();
             }
             Some(Request::Logout { resp_sender, .. }) => {
                 let _ = resp_sender.send(true);
@@ -741,12 +748,14 @@ where
 
         if is_logout {
             state_machine.outbox_clear();
-            state_machine.set_logout_resp_sender(maybe_resp_sender);
+            state_machine.set_logout_resp_sender(
+                maybe_resp_sender.map(|resp_sender| resp_sender.notify_sent(msg_seq_num)),
+            );
             state_machine.handle(&Event::LogoutSent);
             fix_timeouts.start_logout_timeout();
             break;
         } else if let Some(resp_sender) = maybe_resp_sender {
-            let _ = resp_sender.send(true);
+            resp_sender.sent(msg_seq_num);
         }
     }
     Ok(())

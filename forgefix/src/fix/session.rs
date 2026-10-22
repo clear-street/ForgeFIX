@@ -1,7 +1,7 @@
 use crate::fix::encode::{MessageBuilder, SerializedInt};
 use crate::fix::generated::{GapFillFlag, MsgType, PossDupFlag, SessionRejectReason, Tags};
 use crate::fix::{GarbledMessageType, SessionError};
-use crate::SessionSettings;
+use crate::{SendAck, SessionSettings};
 use log::{debug, warn};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -27,7 +27,7 @@ pub(super) enum State {
 }
 
 pub(super) struct MyStateMachine {
-    pub(super) outbox: VecDeque<(MessageBuilder, Option<oneshot::Sender<bool>>)>, // https://github.com/mdeloof/statig/issues/7
+    pub(super) outbox: VecDeque<(MessageBuilder, Option<SendAck>)>, // https://github.com/mdeloof/statig/issues/7
     pub(super) sequences: Sequences,
     pub(super) begin_string: Arc<String>,
     heartbeat_timeout_secs: u32,
@@ -204,11 +204,11 @@ impl MyStateMachine {
     pub(super) fn outbox_push_with_sender(
         &mut self,
         builder: MessageBuilder,
-        resp_sender: oneshot::Sender<bool>,
+        resp_sender: SendAck,
     ) {
         self.outbox.push_back((builder, Some(resp_sender)));
     }
-    pub(super) fn outbox_pop(&mut self) -> Option<(MessageBuilder, Option<oneshot::Sender<bool>>)> {
+    pub(super) fn outbox_pop(&mut self) -> Option<(MessageBuilder, Option<SendAck>)> {
         self.outbox.pop_front()
     }
     pub(super) fn outbox_clear(&mut self) {
