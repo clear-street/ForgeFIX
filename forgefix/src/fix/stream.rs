@@ -397,6 +397,35 @@ mod test {
     }
 
     #[tokio::test]
+    async fn test_read_message_body_length_too_small() {
+        // 9=1 claims a message shorter than the 32 bytes already peeked
+        let garbled: &[u8] = b"8=FIX.4.2\x019=1\x0135=A\x0134=1\x0149=ISLD\x0152=20240506-13:59:15.021\x0156=TW\x0198=0\x01108=30\x01141=Y\x0110=003\x01";
+        let valid: &[u8] = b"8=FIX.4.2\x019=67\x0135=A\x0134=1\x0149=ISLD\x0152=20240506-13:59:15.021\x0156=TW\x0198=0\x01108=30\x01141=Y\x0110=003\x01";
+        let stream = [garbled, valid].concat();
+        let mut incoming = Cursor::new(stream.as_slice());
+        let mut header_buf = HeaderBuf::<{ PEEK_LEN }>::new();
+
+        read_header(&mut incoming, &mut header_buf).await.unwrap();
+        assert!(matches!(
+            read_message(&mut incoming, &mut header_buf, &MockLogger).await,
+            Err(SessionError::GarbledMessage {
+                garbled_msg_type: GarbledMessageType::BodyLengthIssue,
+                ..
+            }),
+        ));
+
+        // the garbled bytes are skipped and the next message still comes through
+        read_header(&mut incoming, &mut header_buf).await.unwrap();
+        assert_eq!(
+            read_message(&mut incoming, &mut header_buf, &MockLogger)
+                .await
+                .unwrap()
+                .0,
+            valid,
+        );
+    }
+
+    #[tokio::test]
     async fn test_read_header() {
         const incoming_message: &[u8] = b"8=FIX.4.2\x019=54\x0135=A\x01".as_slice();
         let mut incoming_header = Cursor::new(incoming_message);
