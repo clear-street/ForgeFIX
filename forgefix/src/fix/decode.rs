@@ -449,7 +449,18 @@ pub(super) fn parse_header(header: &[u8]) -> Result<usize, SessionError> {
     let prefix = parse_peeked_prefix(header)?;
     // body_length does not account for the 7 byte checksum (10=xxx|)
     // and len_end is 1 less that we would like
-    Ok(prefix.body_length - (header.len() - (prefix.len_end + 1)) + 7)
+    let already_read = header.len() - (prefix.len_end + 1);
+    // a BodyLength that ends the message inside the peek is garbage, don't let it wrap
+    prefix
+        .body_length
+        .checked_add(7)
+        .and_then(|n| n.checked_sub(already_read))
+        .ok_or_else(|| {
+            SessionError::new_garbled_message(
+                String::from("BodyLength too small"),
+                GarbledMessageType::BodyLengthIssue,
+            )
+        })
 }
 
 pub(super) struct ParsedPeek {
@@ -697,6 +708,31 @@ mod test {
         if let Ok(_) = parse_peeked_prefix(b"8=FIX.4.2\x019=33333333333333333333333") {
             assert!(false, "Expected error");
         };
+    }
+
+    #[test]
+    fn test_parse_header_body_length_ends_inside_peek() {
+        // BodyLength says the message ended before the bytes already peeked
+        for header in [
+            &b"8=FIX.4.2\x019=1\x0135=0\x0134=1\x0110=000\x01x"[..],
+            b"8=FIX.4.2\x019=09\x0135=0\x0134=1\x0110=000\x01",
+        ] {
+            assert!(matches!(
+                parse_header(header),
+                Err(SessionError::GarbledMessage {
+                    garbled_msg_type: GarbledMessageType::BodyLengthIssue,
+                    ..
+                })
+            ));
+        }
+
+        // a 32 byte message fits in the peek exactly, nothing is left to read
+        let whole = b"8=FIX.4.2\x019=10\x0135=0\x0134=1\x0110=000\x01";
+        assert_eq!(parse_header(whole).unwrap(), 0);
+
+        // ends 3 bytes past the peek, in the middle of the checksum
+        let partial = b"8=FIX.4.2\x019=13\x0135=0\x0134=1234\x0110=0";
+        assert_eq!(parse_header(partial).unwrap(), 3);
     }
 
     #[test]
